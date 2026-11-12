@@ -1,0 +1,37 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <!-- Kinetic outer precision circle/arcs -->
+    <path
+        android:strokeColor="#D0BCFF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M 14,8 A 18,18 0 0,1 38,20" />
+    <path
+        android:strokeColor="#D0BCFF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M 34,40 A 18,18 0 0,1 10,28" />
+
+    <!-- Inner dynamic kinetic impulses -->
+    <path
+        android:strokeColor="#F0F2F5"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M 24,14 L 24,24 L 32,24" />
+    <path
+        android:strokeColor="#8E95A0"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:pathData="M 18,30 L 24,24" />
+
+    <!-- Balance precision nodes -->
+    <path
+        android:fillColor="#D0BCFF"
+        android:pathData="M 14,8 m -2,0 a 2,2 0 1,0 4,0 a 2,2 0 1,0 -4,0" />
+    <path
+        android:fillColor="#D0BCFF"
+        android:pathData="M 34,40 m -2,0 a 2,2 0 1,0 4,0 a 2,2 0 1,0 -4,0" />
+</vector>

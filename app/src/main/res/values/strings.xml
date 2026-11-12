@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">KINETIQ</string>
+    <string name="notification_channel_id">kinetiq_monitoring_channel</string>
+    <string name="notification_channel_name">Motion Monitoring</string>
+    <string name="notification_channel_desc">Active background motion gesture recognition</string>
+    <string name="notification_alert_channel_id">kinetiq_alerts_channel</string>
+    <string name="notification_alert_channel_name">Gesture Alerts</string>
+    <string name="notification_alert_channel_desc">Direct camera launch actions when locked or restricted</string>
+</resources>
+
