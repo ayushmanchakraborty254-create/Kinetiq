@@ -25,6 +25,7 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.FiberManualRecord
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -34,6 +35,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -44,6 +46,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.ayushman.kinetiq.data.sensor.SensorSamplingRate
 import com.ayushman.kinetiq.data.sensor.SensorTraceRecorder
@@ -64,6 +67,7 @@ fun DiagnosticsScreen(
     onNavigateBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     val hardware = viewModel.hardwareStatus
     val prefs by viewModel.userPreferences.collectAsState()
     val liveData by viewModel.liveSensorReadout.collectAsState()
@@ -155,10 +159,20 @@ fun DiagnosticsScreen(
                 ) {
                     SensorTraceRecorder.STANDARD_LABELS.forEach { label ->
                         val isSelected = (currentTraceLabel == label)
+                        val chipText = when (label) {
+                            "intentional_double_wrist_twist" -> "Double Twist"
+                            "single_wrist_flick" -> "Single Flick"
+                            "phone_pickup" -> "Phone Pickup"
+                            "phone_placement" -> "Phone Placement"
+                            "walking" -> "Walking"
+                            "casual_handling" -> "Casual Handling"
+                            "intentional_double_chop" -> "Double Chop"
+                            else -> label.replace('_', ' ')
+                        }
                         FilterChip(
                             selected = isSelected,
                             onClick = { if (!isRecording) viewModel.setTraceLabel(label) },
-                            label = { Text(text = label, style = MaterialTheme.typography.labelMedium) },
+                            label = { Text(text = chipText, style = MaterialTheme.typography.labelMedium) },
                             enabled = !isRecording,
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = KinetiqLavender.copy(alpha = 0.25f),
@@ -305,23 +319,40 @@ fun DiagnosticsScreen(
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    text = "Saved: ${lastSavedTrace!!.fileName} (.json & .csv)",
+                                    text = "Saved: ${lastSavedTrace!!.fileName}",
                                     style = MaterialTheme.typography.labelMedium,
                                     color = KinetiqGreen
                                 )
                             }
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = "Samples: ${lastSavedTrace!!.sampleCount} · Duration: ${lastSavedTrace!!.durationMs}ms",
+                                text = "Samples: ${lastSavedTrace!!.sampleCount} · Duration: ${lastSavedTrace!!.durationMs}ms (.json, .csv, _events.csv)",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = KinetiqOffWhite
                             )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = "Pull to PC: adb pull /storage/emulated/0/Android/data/com.ayushman.kinetiq.debug/files/sensor_traces/ .",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = KinetiqTextMuted
-                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Button(
+                                onClick = { viewModel.exportTrace(context, lastSavedTrace!!) },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(40.dp),
+                                shape = RoundedCornerShape(8.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = KinetiqGreen,
+                                    contentColor = KinetiqObsidian
+                                )
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Share,
+                                    contentDescription = "Export Trace",
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "SHARE / EXPORT THIS TRACE",
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                            }
                         }
                     }
                 }
@@ -329,13 +360,29 @@ fun DiagnosticsScreen(
                 // 5. Saved traces list
                 if (savedTraces.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = "SAVED PHYSICAL TRACES (${savedTraces.size}):",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = KinetiqTextTertiary
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "SAVED TRACES (${savedTraces.size}):",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = KinetiqTextTertiary
+                        )
+                        if (savedTraces.size > 1) {
+                            IconButton(onClick = { viewModel.exportAllTraces(context) }) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Share,
+                                    contentDescription = "Export All",
+                                    tint = KinetiqLavender,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
+                    }
                     Spacer(modifier = Modifier.height(6.dp))
-                    savedTraces.take(6).forEach { trace ->
+                    savedTraces.take(8).forEach { trace ->
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -355,13 +402,23 @@ fun DiagnosticsScreen(
                                     color = KinetiqTextMuted
                                 )
                             }
-                            IconButton(onClick = { viewModel.deleteTrace(trace.fileName) }) {
-                                Icon(
-                                    imageVector = Icons.Outlined.Delete,
-                                    contentDescription = "Delete",
-                                    tint = KinetiqTextMuted,
-                                    modifier = Modifier.size(16.dp)
-                                )
+                            Row {
+                                IconButton(onClick = { viewModel.exportTrace(context, trace) }) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Share,
+                                        contentDescription = "Share",
+                                        tint = KinetiqLavender,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                IconButton(onClick = { viewModel.deleteTrace(trace.fileName) }) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Delete,
+                                        contentDescription = "Delete",
+                                        tint = KinetiqTextMuted,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
                             }
                         }
                     }

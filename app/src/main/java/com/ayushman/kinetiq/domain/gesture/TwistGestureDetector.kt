@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -23,6 +24,8 @@ class TwistGestureDetector(
     companion object {
         private const val TAG = "KinetiqTwist"
     }
+
+    var diagnosticListener: DetectorDiagnosticListener? = null
 
     var sensitivity: SensitivityLevel = initialSensitivity
         set(value) {
@@ -60,6 +63,8 @@ class TwistGestureDetector(
     // State machine timestamps
     private var firstTwistTimestampNs: Long = 0L
     private var firstTwistPeak: Float = 0f
+    private var firstTwistDirection: Int = 0 // +1 (positive) or -1 (negative)
+    private var recoilConfirmed: Boolean = false
     private var cooldownUntilNs: Long = 0L
 
     init {
@@ -104,6 +109,17 @@ class TwistGestureDetector(
             (integratedDisplacement < 0 && primaryAngularVelocity > 0)
         ) {
             // Reversal detected (user twisting back)
+            diagnosticListener?.onDetectorEvent(
+                detector = "TWIST",
+                eventType = "DIRECTION_REVERSAL",
+                timestampNs = nowNs,
+                details = "Sign reversal: vel=${String.format(Locale.US, "%.2f", primaryAngularVelocity)}, prevDispDeg=${String.format(Locale.US, "%.1f°", Math.toDegrees(integratedDisplacement.toDouble()))}, strokePeakVel=${String.format(Locale.US, "%.2f", strokePeakVelocity)} rad/s",
+                metrics = mapOf(
+                    "angularVelocity" to primaryAngularVelocity,
+                    "displacementDeg" to Math.toDegrees(integratedDisplacement.toDouble()),
+                    "strokePeakVel" to strokePeakVelocity
+                )
+            )
             integratedDisplacement = dTheta
             strokePeakVelocity = abs(primaryAngularVelocity)
         } else {
@@ -119,10 +135,26 @@ class TwistGestureDetector(
                 if (strokePeakVelocity >= minAngularVelocity && absDisplacement >= minAngularDisplacementRad) {
                     firstTwistTimestampNs = nowNs
                     firstTwistPeak = strokePeakVelocity
+                    firstTwistDirection = if (integratedDisplacement >= 0f) 1 else -1
+                    recoilConfirmed = false
 
                     Log.d(
                         TAG,
-                        "First twist detected: peakVel=$strokePeakVelocity rad/s, displacement=$absDisplacement rad"
+                        "First twist detected: dir=$firstTwistDirection, peakVel=$strokePeakVelocity rad/s, displacement=$absDisplacement rad"
+                    )
+
+                    diagnosticListener?.onDetectorEvent(
+                        detector = "TWIST",
+                        eventType = "CANDIDATE_START",
+                        timestampNs = nowNs,
+                        details = "First twist accepted: dir=$firstTwistDirection, peakVel=${String.format(Locale.US, "%.2f", strokePeakVelocity)} rad/s (thresh=$minAngularVelocity), dispDeg=${String.format(Locale.US, "%.1f°", Math.toDegrees(absDisplacement.toDouble()))} (thresh=${String.format(Locale.US, "%.1f°", Math.toDegrees(minAngularDisplacementRad.toDouble()))})",
+                        metrics = mapOf(
+                            "direction" to firstTwistDirection,
+                            "peakVel" to strokePeakVelocity,
+                            "minAngularVelocity" to minAngularVelocity,
+                            "displacementDeg" to Math.toDegrees(absDisplacement.toDouble()),
+                            "minDisplacementDeg" to Math.toDegrees(minAngularDisplacementRad.toDouble())
+                        )
                     )
 
                     _state.value = GestureState.FirstMovementDetected(
@@ -147,6 +179,17 @@ class TwistGestureDetector(
 
                 if (elapsedSinceFirstNs > maxWindowDurationNs) {
                     Log.d(TAG, "Double twist window expired after ${elapsedSinceFirstNs / 1_000_000}ms")
+                    diagnosticListener?.onDetectorEvent(
+                        detector = "TWIST",
+                        eventType = "REJECTED",
+                        timestampNs = nowNs,
+                        details = "Double twist window expired after ${elapsedSinceFirstNs / 1_000_000}ms without second twist (recoilConfirmed=$recoilConfirmed)",
+                        metrics = mapOf(
+                            "elapsedMs" to elapsedSinceFirstNs / 1_000_000L,
+                            "recoilConfirmed" to recoilConfirmed,
+                            "reason" to "WINDOW_EXPIRED"
+                        )
+                    )
                     _events.tryEmit(
                         GestureEvent.Rejected(
                             type = GestureType.DOUBLE_TWIST,
@@ -158,8 +201,26 @@ class TwistGestureDetector(
                     return
                 }
 
-                // Check for second twist after minimum separation
-                if (elapsedSinceFirstNs >= minTwistSeparationNs) {
+                val currentDirection = if (primaryAngularVelocity >= 0f) 1 else -1
+
+                // 1. Recoil Verification: Must observe return motion in the opposite direction
+                if (!recoilConfirmed && currentDirection != firstTwistDirection) {
+                    if (absDisplacement >= Math.toRadians(4.0).toFloat()) {
+                        recoilConfirmed = true
+                        _state.value = currentState.copy(neutralConfirmed = true)
+                        Log.d(TAG, "Twist recoil confirmed: return displacement=${Math.toDegrees(absDisplacement.toDouble())}°")
+                        diagnosticListener?.onDetectorEvent(
+                            detector = "TWIST",
+                            eventType = "RECOIL_CONFIRMED",
+                            timestampNs = nowNs,
+                            details = "Twist recoil confirmed: return displacement=${String.format(Locale.US, "%.1f°", Math.toDegrees(absDisplacement.toDouble()))}",
+                            metrics = mapOf("returnDispDeg" to Math.toDegrees(absDisplacement.toDouble()))
+                        )
+                    }
+                }
+
+                // 2. Second Twist Acceptance: ONLY after recoil is confirmed AND moving in matching twist direction
+                if (recoilConfirmed && currentDirection == firstTwistDirection && elapsedSinceFirstNs >= minTwistSeparationNs) {
                     if (strokePeakVelocity >= minAngularVelocity && absDisplacement >= minAngularDisplacementRad) {
                         val durationMs = (elapsedSinceFirstNs / 1_000_000L)
                         val confidence = calculateConfidence(firstTwistPeak, strokePeakVelocity)
@@ -168,6 +229,19 @@ class TwistGestureDetector(
                             TAG,
                             "Double twist recognized! peak1=$firstTwistPeak, peak2=$strokePeakVelocity, " +
                                 "duration=${durationMs}ms, confidence=$confidence"
+                        )
+
+                        diagnosticListener?.onDetectorEvent(
+                            detector = "TWIST",
+                            eventType = "RECOGNIZED",
+                            timestampNs = nowNs,
+                            details = "Double twist recognized! peak1=${String.format(Locale.US, "%.2f", firstTwistPeak)}, peak2=${String.format(Locale.US, "%.2f", strokePeakVelocity)}, duration=${durationMs}ms, confidence=${String.format(Locale.US, "%.0f%%", confidence * 100)}",
+                            metrics = mapOf(
+                                "peak1" to firstTwistPeak,
+                                "peak2" to strokePeakVelocity,
+                                "durationMs" to durationMs,
+                                "confidence" to confidence
+                            )
                         )
 
                         _state.value = GestureState.SecondMovementDetected(
@@ -219,6 +293,8 @@ class TwistGestureDetector(
         _state.value = GestureState.Idle
         firstTwistTimestampNs = 0L
         firstTwistPeak = 0f
+        firstTwistDirection = 0
+        recoilConfirmed = false
         cooldownUntilNs = 0L
         lastTimestampNs = 0L
         lastAngularVelocity = 0f

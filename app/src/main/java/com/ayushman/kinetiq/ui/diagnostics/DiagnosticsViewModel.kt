@@ -1,6 +1,10 @@
 package com.ayushman.kinetiq.ui.diagnostics
 
 import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.ayushman.kinetiq.KinetiqApplication
@@ -20,6 +24,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.io.File
 
 data class LiveSensorReadout(
     val linearAccelMagnitude: Float = 0f,
@@ -150,6 +155,64 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
 
     fun refreshTraces() {
         traceRecorder.refreshSavedTraces()
+    }
+
+    fun exportTrace(context: Context, trace: TraceFileInfo) {
+        val baseName = trace.fileName.removeSuffix(".json")
+        val dir = File(context.getExternalFilesDir(null), "sensor_traces")
+        val jsonFile = File(dir, "$baseName.json")
+        val csvFile = File(dir, "$baseName.csv")
+        val eventsFile = File(dir, "${baseName}_events.csv")
+
+        val uris = ArrayList<Uri>()
+        val authority = "${context.packageName}.fileprovider"
+
+        if (jsonFile.exists()) {
+            uris.add(FileProvider.getUriForFile(context, authority, jsonFile))
+        }
+        if (csvFile.exists()) {
+            uris.add(FileProvider.getUriForFile(context, authority, csvFile))
+        }
+        if (eventsFile.exists()) {
+            uris.add(FileProvider.getUriForFile(context, authority, eventsFile))
+        }
+
+        if (uris.isNotEmpty()) {
+            val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                type = "*/*"
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(intent, "Export Sensor Traces (${trace.label})").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(chooser)
+        }
+    }
+
+    fun exportAllTraces(context: Context) {
+        val dir = File(context.getExternalFilesDir(null), "sensor_traces")
+        val files = dir.listFiles() ?: return
+        val uris = ArrayList<Uri>()
+        val authority = "${context.packageName}.fileprovider"
+
+        for (f in files) {
+            if (f.isFile && (f.name.endsWith(".json") || f.name.endsWith(".csv"))) {
+                uris.add(FileProvider.getUriForFile(context, authority, f))
+            }
+        }
+
+        if (uris.isNotEmpty()) {
+            val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                type = "*/*"
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(intent, "Export All Recorded Traces (${uris.size} files)").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(chooser)
+        }
     }
 
     fun resetDiagnostics() {

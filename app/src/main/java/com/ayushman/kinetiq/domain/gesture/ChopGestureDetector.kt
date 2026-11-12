@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
 
@@ -23,6 +24,8 @@ class ChopGestureDetector(
     companion object {
         private const val TAG = "KinetiqChop"
     }
+
+    var diagnosticListener: DetectorDiagnosticListener? = null
 
     var sensitivity: SensitivityLevel = initialSensitivity
         set(value) {
@@ -97,24 +100,50 @@ class ChopGestureDetector(
 
         when (val currentState = _state.value) {
             is GestureState.Idle -> {
-                if (smoothedMagnitude >= peakThreshold && isChopAxisAligned) {
-                    firstChopTimestampNs = nowNs
-                    firstChopPeak = smoothedMagnitude
-                    neutralConfirmed = false
-
-                    Log.d(TAG, "First chop peak detected: mag=$smoothedMagnitude, thresh=$peakThreshold, axisAligned=$isChopAxisAligned")
-
-                    _state.value = GestureState.FirstMovementDetected(
-                        timestampNs = nowNs,
-                        peakMagnitude = smoothedMagnitude
-                    )
-
-                    // Immediately transition to waiting for second chop with deadline
-                    _state.value = GestureState.WaitingForSecondMovement(
-                        firstTimestampNs = nowNs,
-                        deadlineNs = nowNs + maxWindowDurationNs,
+                if (smoothedMagnitude >= peakThreshold) {
+                    if (isChopAxisAligned) {
+                        firstChopTimestampNs = nowNs
+                        firstChopPeak = smoothedMagnitude
                         neutralConfirmed = false
-                    )
+
+                        Log.d(TAG, "First chop peak detected: mag=$smoothedMagnitude, thresh=$peakThreshold, axisAligned=$isChopAxisAligned")
+
+                        diagnosticListener?.onDetectorEvent(
+                            detector = "CHOP",
+                            eventType = "CANDIDATE_START",
+                            timestampNs = nowNs,
+                            details = "First chop peak detected: mag=${String.format(Locale.US, "%.2f", smoothedMagnitude)}, thresh=$peakThreshold, axisAligned=true",
+                            metrics = mapOf(
+                                "peakMagnitude" to smoothedMagnitude,
+                                "peakThreshold" to peakThreshold,
+                                "axisAligned" to true
+                            )
+                        )
+
+                        _state.value = GestureState.FirstMovementDetected(
+                            timestampNs = nowNs,
+                            peakMagnitude = smoothedMagnitude
+                        )
+
+                        // Immediately transition to waiting for second chop with deadline
+                        _state.value = GestureState.WaitingForSecondMovement(
+                            firstTimestampNs = nowNs,
+                            deadlineNs = nowNs + maxWindowDurationNs,
+                            neutralConfirmed = false
+                        )
+                    } else {
+                        diagnosticListener?.onDetectorEvent(
+                            detector = "CHOP",
+                            eventType = "PEAK_REJECTED",
+                            timestampNs = nowNs,
+                            details = "Peak reached ${String.format(Locale.US, "%.2f", smoothedMagnitude)} >= $peakThreshold but rejected (lateral X acceleration dominated)",
+                            metrics = mapOf(
+                                "peakMagnitude" to smoothedMagnitude,
+                                "peakThreshold" to peakThreshold,
+                                "axisAligned" to false
+                            )
+                        )
+                    }
                 }
             }
 
@@ -124,6 +153,17 @@ class ChopGestureDetector(
                 // Check window expiration
                 if (elapsedSinceFirstNs > maxWindowDurationNs) {
                     Log.d(TAG, "Double chop window expired after ${elapsedSinceFirstNs / 1_000_000}ms without second chop")
+                    diagnosticListener?.onDetectorEvent(
+                        detector = "CHOP",
+                        eventType = "REJECTED",
+                        timestampNs = nowNs,
+                        details = "Window expired after ${elapsedSinceFirstNs / 1_000_000}ms without second chop (neutralConfirmed=$neutralConfirmed)",
+                        metrics = mapOf(
+                            "elapsedMs" to elapsedSinceFirstNs / 1_000_000L,
+                            "neutralConfirmed" to neutralConfirmed,
+                            "reason" to "WINDOW_EXPIRED"
+                        )
+                    )
                     _events.tryEmit(
                         GestureEvent.Rejected(
                             type = GestureType.DOUBLE_CHOP,
@@ -144,38 +184,74 @@ class ChopGestureDetector(
                     neutralConfirmed = true
                     neutralConfirmedTimestampNs = nowNs
                     Log.d(TAG, "Recoil/valley confirmed: mag=$smoothedMagnitude (recoilThreshold=$recoilThreshold)")
+                    diagnosticListener?.onDetectorEvent(
+                        detector = "CHOP",
+                        eventType = "RECOIL_CONFIRMED",
+                        timestampNs = nowNs,
+                        details = "Recoil/valley confirmed: mag=${String.format(Locale.US, "%.2f", smoothedMagnitude)} <= recoilThreshold=${String.format(Locale.US, "%.2f", recoilThreshold)}",
+                        metrics = mapOf(
+                            "smoothedMagnitude" to smoothedMagnitude,
+                            "recoilThreshold" to recoilThreshold
+                        )
+                    )
                     _state.value = currentState.copy(neutralConfirmed = true)
                 }
 
                 // Accept second strike only after neutral recoil has been confirmed AND minimum separation elapsed
                 if (neutralConfirmed && elapsedSinceFirstNs >= minPeakSeparationNs) {
-                    if (smoothedMagnitude >= peakThreshold && isChopAxisAligned) {
-                        val durationMs = (elapsedSinceFirstNs / 1_000_000L)
-                        val confidence = calculateConfidence(firstChopPeak, smoothedMagnitude)
+                    if (smoothedMagnitude >= peakThreshold) {
+                        if (isChopAxisAligned) {
+                            val durationMs = (elapsedSinceFirstNs / 1_000_000L)
+                            val confidence = calculateConfidence(firstChopPeak, smoothedMagnitude)
 
-                        Log.i(
-                            TAG,
-                            "Double chop recognized! peak1=$firstChopPeak, peak2=$smoothedMagnitude, " +
-                                "duration=${durationMs}ms, confidence=$confidence"
-                        )
-
-                        _state.value = GestureState.SecondMovementDetected(
-                            timestampNs = nowNs,
-                            peakMagnitude = smoothedMagnitude
-                        )
-
-                        _events.tryEmit(
-                            GestureEvent.Recognized(
-                                type = GestureType.DOUBLE_CHOP,
-                                timestampNs = nowNs,
-                                confidence = confidence,
-                                executionDurationMs = durationMs
+                            Log.i(
+                                TAG,
+                                "Double chop recognized! peak1=$firstChopPeak, peak2=$smoothedMagnitude, " +
+                                    "duration=${durationMs}ms, confidence=$confidence"
                             )
-                        )
 
-                        // Enter cooldown to avoid duplicate triggers from deceleration rebound
-                        cooldownUntilNs = nowNs + cooldownDurationNs
-                        _state.value = GestureState.Cooldown(untilNs = cooldownUntilNs)
+                            diagnosticListener?.onDetectorEvent(
+                                detector = "CHOP",
+                                eventType = "RECOGNIZED",
+                                timestampNs = nowNs,
+                                details = "Double chop recognized! peak1=${String.format(Locale.US, "%.2f", firstChopPeak)}, peak2=${String.format(Locale.US, "%.2f", smoothedMagnitude)}, duration=${durationMs}ms, confidence=${String.format(Locale.US, "%.0f%%", confidence * 100)}",
+                                metrics = mapOf(
+                                    "peak1" to firstChopPeak,
+                                    "peak2" to smoothedMagnitude,
+                                    "durationMs" to durationMs,
+                                    "confidence" to confidence
+                                )
+                            )
+
+                            _state.value = GestureState.SecondMovementDetected(
+                                timestampNs = nowNs,
+                                peakMagnitude = smoothedMagnitude
+                            )
+
+                            _events.tryEmit(
+                                GestureEvent.Recognized(
+                                    type = GestureType.DOUBLE_CHOP,
+                                    timestampNs = nowNs,
+                                    confidence = confidence,
+                                    executionDurationMs = durationMs
+                                )
+                            )
+
+                            // Enter cooldown to avoid duplicate triggers from deceleration rebound
+                            cooldownUntilNs = nowNs + cooldownDurationNs
+                            _state.value = GestureState.Cooldown(untilNs = cooldownUntilNs)
+                        } else {
+                            diagnosticListener?.onDetectorEvent(
+                                detector = "CHOP",
+                                eventType = "SECOND_PEAK_REJECTED",
+                                timestampNs = nowNs,
+                                details = "Second peak reached ${String.format(Locale.US, "%.2f", smoothedMagnitude)} >= $peakThreshold but rejected (lateral X acceleration dominated)",
+                                metrics = mapOf(
+                                    "peakMagnitude" to smoothedMagnitude,
+                                    "axisAligned" to false
+                                )
+                            )
+                        }
                     }
                 }
             }

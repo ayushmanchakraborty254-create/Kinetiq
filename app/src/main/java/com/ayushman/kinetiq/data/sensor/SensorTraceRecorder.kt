@@ -6,9 +6,9 @@ import android.os.Build
 import android.os.PowerManager
 import android.util.Log
 import com.ayushman.kinetiq.domain.gesture.ChopGestureDetector
+import com.ayushman.kinetiq.domain.gesture.DetectorDiagnosticListener
 import com.ayushman.kinetiq.domain.gesture.GestureEngine
 import com.ayushman.kinetiq.domain.gesture.TwistGestureDetector
-import com.ayushman.kinetiq.domain.model.GestureEvent
 import com.ayushman.kinetiq.domain.model.SensorReading
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -32,6 +32,15 @@ enum class SensorSamplingRate(val displayName: String, val delayUs: Int) {
     NORMAL("NORMAL (5 Hz)", SensorManager.SENSOR_DELAY_NORMAL)
 }
 
+data class DiagnosticDetectorEvent(
+    val timestampNs: Long,
+    val elapsedMs: Long,
+    val detector: String,
+    val eventType: String,
+    val details: String,
+    val metricsJson: String
+)
+
 data class TraceSample(
     val timestampNs: Long,
     val elapsedMs: Long,
@@ -44,7 +53,16 @@ data class TraceSample(
     val orientation: Int,
     val screenInteractive: Boolean,
     val chopState: String,
-    val twistState: String
+    val twistState: String,
+    // Synchronized sensor state at this exact instant
+    val syncAx: Float,
+    val syncAy: Float,
+    val syncAz: Float,
+    val syncAccelMag: Float,
+    val syncGx: Float,
+    val syncGy: Float,
+    val syncGz: Float,
+    val syncGyroSpeed: Float
 )
 
 data class TraceFileInfo(
@@ -64,14 +82,15 @@ class SensorTraceRecorder(
 ) {
     companion object {
         private const val TAG = "KinetiqRecorder"
+
         val STANDARD_LABELS = listOf(
-            "double_twist_intentional",
-            "double_chop_natural",
-            "double_chop_forceful",
-            "table_pickup",
-            "table_placement",
-            "walking_in_hand",
-            "casual_handling"
+            "intentional_double_wrist_twist",
+            "single_wrist_flick",
+            "phone_pickup",
+            "phone_placement",
+            "walking",
+            "casual_handling",
+            "intentional_double_chop"
         )
     }
 
@@ -105,6 +124,7 @@ class SensorTraceRecorder(
     private var activeJob: Job? = null
     private var tickerJob: Job? = null
     private val samplesQueue = ConcurrentLinkedQueue<TraceSample>()
+    private val detectorEventsQueue = ConcurrentLinkedQueue<DiagnosticDetectorEvent>()
 
     private var recordingStartEpochMs: Long = 0L
     private var recordingStartNs: Long = 0L
@@ -114,6 +134,17 @@ class SensorTraceRecorder(
     private var lastRawAccelNs: Long = 0L
     private var lastGyroNs: Long = 0L
     private var lastProxNs: Long = 0L
+
+    // Synchronized sensor state cache
+    @Volatile private var latestAx: Float = 0f
+    @Volatile private var latestAy: Float = 0f
+    @Volatile private var latestAz: Float = 0f
+    @Volatile private var latestAccelMag: Float = 0f
+
+    @Volatile private var latestGx: Float = 0f
+    @Volatile private var latestGy: Float = 0f
+    @Volatile private var latestGz: Float = 0f
+    @Volatile private var latestGyroSpeed: Float = 0f
 
     init {
         refreshSavedTraces()
@@ -135,6 +166,7 @@ class SensorTraceRecorder(
         val activeLabel = label ?: _currentLabel.value
         _currentLabel.value = activeLabel
         samplesQueue.clear()
+        detectorEventsQueue.clear()
         _sampleCount.value = 0
         _elapsedMs.value = 0L
 
@@ -148,6 +180,33 @@ class SensorTraceRecorder(
 
         observerChopDetector.reset()
         observerTwistDetector.reset()
+
+        // Attach diagnostic event listener to capture candidate starts, peaks, reversals, rejections, recognitions
+        val diagListener = object : DetectorDiagnosticListener {
+            override fun onDetectorEvent(
+                detector: String,
+                eventType: String,
+                timestampNs: Long,
+                details: String,
+                metrics: Map<String, Any>
+            ) {
+                val elapsedMs = (System.nanoTime() - recordingStartNs) / 1_000_000L
+                val metricsJson = JSONObject(metrics).toString()
+                detectorEventsQueue.add(
+                    DiagnosticDetectorEvent(
+                        timestampNs = timestampNs,
+                        elapsedMs = elapsedMs,
+                        detector = detector,
+                        eventType = eventType,
+                        details = details,
+                        metricsJson = metricsJson
+                    )
+                )
+                Log.d(TAG, "[$detector] $eventType: $details")
+            }
+        }
+        observerChopDetector.diagnosticListener = diagListener
+        observerTwistDetector.diagnosticListener = diagListener
 
         // Suppress any gesture actions in GestureEngine during diagnostic capture
         GestureEngine.isDiagnosticSuppressed = true
@@ -165,6 +224,11 @@ class SensorTraceRecorder(
                     val nowNs = reading.timestampNs
                     val intervalMs = if (lastLinAccelNs > 0) (nowNs - lastLinAccelNs) / 1_000_000f else 0f
                     lastLinAccelNs = nowNs
+
+                    latestAx = reading.x
+                    latestAy = reading.y
+                    latestAz = reading.z
+                    latestAccelMag = reading.magnitude
 
                     recordSample(
                         sensorType = "LINEAR_ACCEL",
@@ -206,6 +270,11 @@ class SensorTraceRecorder(
                     val nowNs = reading.timestampNs
                     val intervalMs = if (lastGyroNs > 0) (nowNs - lastGyroNs) / 1_000_000f else 0f
                     lastGyroNs = nowNs
+
+                    latestGx = reading.x
+                    latestGy = reading.y
+                    latestGz = reading.z
+                    latestGyroSpeed = reading.angularSpeed
 
                     recordSample(
                         sensorType = "GYROSCOPE",
@@ -277,7 +346,15 @@ class SensorTraceRecorder(
             orientation = orientation,
             screenInteractive = isScreenOn,
             chopState = observerChopDetector.state.value.toString(),
-            twistState = observerTwistDetector.state.value.toString()
+            twistState = observerTwistDetector.state.value.toString(),
+            syncAx = latestAx,
+            syncAy = latestAy,
+            syncAz = latestAz,
+            syncAccelMag = latestAccelMag,
+            syncGx = latestGx,
+            syncGy = latestGy,
+            syncGz = latestGz,
+            syncGyroSpeed = latestGyroSpeed
         )
         samplesQueue.add(sample)
     }
@@ -288,10 +365,13 @@ class SensorTraceRecorder(
         _isRecording.value = false
         activeJob?.cancel()
         tickerJob?.cancel()
+        observerChopDetector.diagnosticListener = null
+        observerTwistDetector.diagnosticListener = null
         GestureEngine.isDiagnosticSuppressed = false
 
         val totalDurationMs = System.currentTimeMillis() - recordingStartEpochMs
         val samplesList = samplesQueue.toList()
+        val eventsList = detectorEventsQueue.toList()
         _sampleCount.value = samplesList.size
 
         if (samplesList.isEmpty()) {
@@ -299,13 +379,17 @@ class SensorTraceRecorder(
             return null
         }
 
-        val info = saveTraceToDisk(samplesList, totalDurationMs)
+        val info = saveTraceToDisk(samplesList, eventsList, totalDurationMs)
         _lastSavedTrace.value = info
         refreshSavedTraces()
         return info
     }
 
-    private fun saveTraceToDisk(samples: List<TraceSample>, durationMs: Long): TraceFileInfo {
+    private fun saveTraceToDisk(
+        samples: List<TraceSample>,
+        events: List<DiagnosticDetectorEvent>,
+        durationMs: Long
+    ): TraceFileInfo {
         val dir = File(context.getExternalFilesDir(null), "sensor_traces")
         if (!dir.exists()) {
             dir.mkdirs()
@@ -316,27 +400,59 @@ class SensorTraceRecorder(
 
         val jsonFile = File(dir, "$baseName.json")
         val csvFile = File(dir, "$baseName.csv")
+        val eventsFile = File(dir, "${baseName}_events.csv")
 
-        // 1. Write CSV
+        // 1. Write CSV with synchronized columns
         FileWriter(csvFile).use { writer ->
-            writer.appendLine("timestampNs,elapsedMs,sensorType,x,y,z,magnitude,intervalMs,orientation,screenInteractive,chopState,twistState")
+            writer.appendLine("timestampNs,elapsedMs,sensorType,x,y,z,magnitude,intervalMs,syncAx,syncAy,syncAz,syncAccelMag,syncGx,syncGy,syncGz,syncGyroSpeed,orientation,screenInteractive,chopState,twistState")
             for (s in samples) {
-                writer.appendLine("${s.timestampNs},${s.elapsedMs},${s.sensorType},${s.x},${s.y},${s.z},${s.magnitude},${s.intervalMs},${s.orientation},${s.screenInteractive},\"${s.chopState}\",\"${s.twistState}\"")
+                writer.appendLine(
+                    "${s.timestampNs},${s.elapsedMs},${s.sensorType},${s.x},${s.y},${s.z},${s.magnitude},${s.intervalMs}," +
+                    "${s.syncAx},${s.syncAy},${s.syncAz},${s.syncAccelMag}," +
+                    "${s.syncGx},${s.syncGy},${s.syncGz},${s.syncGyroSpeed}," +
+                    "${s.orientation},${s.screenInteractive},\"${s.chopState}\",\"${s.twistState}\""
+                )
             }
         }
 
-        // 2. Write JSON
+        // 2. Write Events CSV (chronological log of detector transitions, candidate starts, reversals, rejections, recognitions)
+        FileWriter(eventsFile).use { writer ->
+            writer.appendLine("timestampNs,elapsedMs,detector,eventType,details,metrics")
+            for (e in events) {
+                writer.appendLine("${e.timestampNs},${e.elapsedMs},${e.detector},${e.eventType},\"${e.details.replace("\"", "\"\"")}\",\"${e.metricsJson.replace("\"", "\"\"")}\"")
+            }
+        }
+
+        // 3. Write comprehensive JSON
         val root = JSONObject()
         root.put("label", _currentLabel.value)
         root.put("timestampEpochMs", recordingStartEpochMs)
         root.put("dateFormatted", dateStamp)
         root.put("durationMs", durationMs)
         root.put("sampleCount", samples.size)
+        root.put("eventCount", events.size)
         root.put("requestedRate", _selectedRate.value.name)
         root.put("deviceManufacturer", Build.MANUFACTURER)
         root.put("deviceModel", Build.MODEL)
         root.put("deviceBrand", Build.BRAND)
         root.put("osVersionSdk", Build.VERSION.SDK_INT)
+
+        val eventsArray = JSONArray()
+        for (e in events) {
+            val eObj = JSONObject()
+            eObj.put("t_ns", e.timestampNs)
+            eObj.put("elapsed_ms", e.elapsedMs)
+            eObj.put("detector", e.detector)
+            eObj.put("event", e.eventType)
+            eObj.put("details", e.details)
+            try {
+                eObj.put("metrics", JSONObject(e.metricsJson))
+            } catch (_: Exception) {
+                eObj.put("metrics", e.metricsJson)
+            }
+            eventsArray.put(eObj)
+        }
+        root.put("detectorEvents", eventsArray)
 
         val samplesArray = JSONArray()
         for (s in samples) {
@@ -349,6 +465,10 @@ class SensorTraceRecorder(
             sObj.put("z", s.z)
             sObj.put("mag", s.magnitude)
             sObj.put("dt_ms", s.intervalMs)
+            sObj.put("sync_a", JSONArray(floatArrayOf(s.syncAx, s.syncAy, s.syncAz)))
+            sObj.put("sync_a_mag", s.syncAccelMag)
+            sObj.put("sync_g", JSONArray(floatArrayOf(s.syncGx, s.syncGy, s.syncGz)))
+            sObj.put("sync_g_speed", s.syncGyroSpeed)
             sObj.put("orient", s.orientation)
             sObj.put("screen", s.screenInteractive)
             sObj.put("chop", s.chopState)
@@ -359,7 +479,7 @@ class SensorTraceRecorder(
 
         FileWriter(jsonFile).use { it.write(root.toString(2)) }
 
-        Log.i(TAG, "Saved trace: ${jsonFile.absolutePath} (${samples.size} samples, ${durationMs}ms)")
+        Log.i(TAG, "Saved trace: ${jsonFile.absolutePath} (${samples.size} samples, ${events.size} events, ${durationMs}ms)")
 
         return TraceFileInfo(
             fileName = "$baseName.json",
@@ -367,7 +487,7 @@ class SensorTraceRecorder(
             label = _currentLabel.value,
             sampleCount = samples.size,
             durationMs = durationMs,
-            fileSizeBytes = jsonFile.length() + csvFile.length(),
+            fileSizeBytes = jsonFile.length() + csvFile.length() + eventsFile.length(),
             timestampFormatted = SimpleDateFormat("MMM dd, HH:mm:ss", Locale.getDefault()).format(Date(recordingStartEpochMs))
         )
     }
@@ -386,7 +506,7 @@ class SensorTraceRecorder(
                 fileName = f.name,
                 filePath = f.absolutePath,
                 label = label,
-                sampleCount = -1, // loaded from file if needed
+                sampleCount = -1,
                 durationMs = 0L,
                 fileSizeBytes = f.length(),
                 timestampFormatted = SimpleDateFormat("MMM dd, HH:mm:ss", Locale.getDefault()).format(Date(f.lastModified()))
@@ -400,7 +520,7 @@ class SensorTraceRecorder(
         val baseName = fileName.removeSuffix(".json")
         File(dir, "$baseName.json").delete()
         File(dir, "$baseName.csv").delete()
+        File(dir, "${baseName}_events.csv").delete()
         refreshSavedTraces()
     }
 }
-
